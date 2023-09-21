@@ -5,8 +5,6 @@ from binaryninja.log import log_debug, log_info, log_warn, log_error
 from .disassembler import disassemble, Instruction
 from .bpf import *
 
-# binja renders accesses to 0 as *nullptr, shift the memory up to avoid it
-MEMORY_BASE = 0x100000
 MEMORY_CELLS = 16
 SECCOMP_DATA_BASE = 0x200000
 
@@ -19,18 +17,19 @@ class Seccomp(Architecture):
     regs = {
         'A': RegisterInfo('A', 4),
         'X': RegisterInfo('X', 4),
+        'zero': RegisterInfo('zero', 4), # register stack top, always zero
         '_SP': RegisterInfo('_SP', 4), # unused
-        'zero': RegisterInfo('zero', 4), # unused
-        **{
+
+        **{ # registers that will form the memory cells
             RegisterName(f'mem_{i}'): RegisterInfo(f'mem_{i}', 4)
             for i in range(MEMORY_CELLS)
         }
-    } # type: ignore
+    }
     stack_pointer = '_SP'
 
     reg_stacks = {
         'mem': RegisterStackInfo([f'mem_{i}' for i in range(MEMORY_CELLS)], [], 'zero')
-    } # type: ignore
+    }
 
     intrinsics = {
         'return': IntrinsicInfo([IntrinsicInput(Type.int(4), 'ret')], [])
@@ -181,6 +180,12 @@ class Seccomp(Architecture):
             log_warn(f'Unknown instruction at {hex(addr)}')
             return 8
 
+        # initial setup
+        if addr == 0:
+            il.append(il.set_reg(4, 'A', il.const(4, 0)))
+            il.append(il.set_reg(4, 'X', il.const(4, 0)))
+            il.append(il.set_reg(4, 'zero', il.const(4, 0)))
+
         class_ = BPF_CLASS(i.code)
         op = BPF_OP(i.code)
         src = BPF_SRC(i.code)
@@ -277,16 +282,16 @@ class Seccomp(Architecture):
             il.append(il.set_reg(4, 'X', il.const(4, i.k)))
 
         elif i.code == BPF_LD | BPF_MEM:
-            il.append(il.set_reg(4, 'A', il.load(4, il.const_pointer(4, MEMORY_BASE + i.k * 4))))
+            il.append(il.set_reg(4, 'A', il.reg_stack_top_relative(4, 'mem', il.const(4, i.k))))
 
         elif i.code == BPF_LDX | BPF_MEM:
-            il.append(il.set_reg(4, 'X', il.load(4, il.const_pointer(4, MEMORY_BASE + i.k * 4))))
+            il.append(il.set_reg(4, 'X', il.reg_stack_top_relative(4, 'mem', il.const(4, i.k))))
 
         elif i.code == BPF_ST:
-            il.append(il.store(4, il.const_pointer(4, MEMORY_BASE + i.k * 4), il.reg(4, 'A')))
+            il.append(il.set_reg_stack_top_relative(4, 'mem', il.const(4, i.k), il.reg(4, 'A')))
 
         elif i.code == BPF_STX:
-            il.append(il.store(4, il.const_pointer(4, MEMORY_BASE + i.k * 4), il.reg(4, 'X')))
+            il.append(il.set_reg_stack_top_relative(4, 'mem', il.const(4, i.k), il.reg(4, 'X')))
 
         elif i.code == BPF_LD | BPF_W | BPF_ABS:
             il.append(il.set_reg(4, 'A', il.load(4, il.const_pointer(4, SECCOMP_DATA_BASE + i.k))))
@@ -318,13 +323,6 @@ class SeccompView(BinaryView):
         self.add_auto_section('text', 0, self.data.length, SectionSemantics.ReadOnlyCodeSectionSemantics)
         self.add_entry_point(0)
         self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, 0, 'filter'))
-
-        # Data
-        self.add_auto_segment(
-            MEMORY_BASE, MEMORY_CELLS * 4, 0, 0,
-            SegmentFlag.SegmentReadable | SegmentFlag.SegmentWritable | SegmentFlag.SegmentContainsData
-        )
-        self.add_auto_section('memory', MEMORY_BASE, MEMORY_CELLS * 4, SectionSemantics.ReadWriteDataSectionSemantics)
 
         # Syscall data
         self.add_auto_segment(
