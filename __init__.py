@@ -27,9 +27,14 @@ class Seccomp(Architecture):
         }
     } # type: ignore
     stack_pointer = '_SP'
+
     reg_stacks = {
         'mem': RegisterStackInfo([f'mem_{i}' for i in range(MEMORY_CELLS)], [], 'zero')
     } # type: ignore
+
+    intrinsics = {
+        'return': IntrinsicInfo([IntrinsicInput(Type.int(4), 'ret')], [])
+    }
 
     def get_instruction_info(self, data: bytes, addr: int) -> InstructionInfo | None:
         i = disassemble(data)
@@ -173,9 +178,122 @@ class Seccomp(Architecture):
         i = disassemble(data)
         if i is None:
             il.append(il.unimplemented())
+            log_warn(f'Unknown instruction at {hex(addr)}')
             return 8
 
-        il.append(il.unimplemented())
+        class_ = BPF_CLASS(i.code)
+        op = BPF_OP(i.code)
+        src = BPF_SRC(i.code)
+
+        if i.code == BPF_RET | BPF_K:
+            il.append(il.intrinsic([], 'return', [il.const(4, i.k)]))
+            il.append(il.no_ret())
+
+        elif i.code == BPF_RET | BPF_A:
+            il.append(il.intrinsic([], 'return', [il.reg(4, 'A')]))
+            il.append(il.no_ret())
+
+        elif class_ == BPF_ALU:
+            if op == BPF_NEG:
+                il.append(il.set_reg(4, 'A', il.neg_expr(4, il.reg(4, 'A'))))
+            else:
+                value = {
+                    BPF_K: il.const(4, i.k),
+                    BPF_X: il.reg(4, 'X'),
+                }[src]
+
+                aluop = {
+                    BPF_ADD: il.add,
+                    BPF_SUB: il.sub,
+                    BPF_MUL: il.mult,
+                    BPF_DIV: il.div_signed, # TODO is it really signed?
+                    BPF_AND: il.and_expr,
+                    BPF_OR: il.or_expr,
+                    BPF_XOR: il.xor_expr,
+                    BPF_LSH: il.shift_left,
+                    BPF_RSH: il.logical_shift_right,
+                }[op]
+
+                value = aluop(4, il.reg(4, 'A'), value)
+                il.append(il.set_reg(4, 'A', value))
+
+        elif i.code == BPF_MISC | BPF_TAX:
+            il.append(il.set_reg(4, 'X', il.reg(4, 'A')))
+
+        elif i.code == BPF_MISC | BPF_TXA:
+            il.append(il.set_reg(4, 'A', il.reg(4, 'X')))
+
+        elif class_ == BPF_JMP:
+            if op == BPF_JA:
+                target = addr + i.k * 8 + 8
+                il.append(il.jump(il.const_pointer(4, target)))
+            else:
+                jt = addr + i.jt * 8 + 8
+                jf = addr + i.jf * 8 + 8
+
+                value = {
+                    BPF_K: il.const(4, i.k),
+                    BPF_X: il.reg(4, 'X'),
+                }[src]
+
+                if op == BPF_JSET:
+                    cmp = il.compare_not_equal(
+                        4,
+                        il.and_expr(4, il.reg(4, 'A'), value),
+                        il.const(4, 0)
+                    )
+                else:
+                    cmp = {
+                        BPF_JEQ: il.compare_equal,
+                        BPF_JGT: il.compare_signed_greater_than, # TODO: unsigned?
+                        BPF_JGE: il.compare_signed_greater_equal,
+                    }[op](4, il.reg(4, 'A'), value)
+
+                t = il.get_label_for_address(Architecture['Seccomp'], jt)
+                indirect_t = False
+                if t is None:
+                    indirect_t = True
+                    t = LowLevelILLabel()
+
+                f = il.get_label_for_address(Architecture['Seccomp'], jf)
+                indirect_f = False
+                if f is None:
+                    indirect_f = True
+                    f = LowLevelILLabel()
+
+                il.append(il.if_expr(cmp, t, f))
+
+                if indirect_t:
+                    il.mark_label(t)
+                    il.append(il.jump(il.const_pointer(4, jt)))
+                if indirect_f:
+                    il.mark_label(f)
+                    il.append(il.jump(il.const_pointer(4, jf)))
+
+        elif i.code == BPF_LD | BPF_IMM:
+            il.append(il.set_reg(4, 'A', il.const(4, i.k)))
+
+        elif i.code == BPF_LDX | BPF_IMM:
+            il.append(il.set_reg(4, 'X', il.const(4, i.k)))
+
+        elif i.code == BPF_LD | BPF_MEM:
+            il.append(il.set_reg(4, 'A', il.load(4, il.const_pointer(4, MEMORY_BASE + i.k * 4))))
+
+        elif i.code == BPF_LDX | BPF_MEM:
+            il.append(il.set_reg(4, 'X', il.load(4, il.const_pointer(4, MEMORY_BASE + i.k * 4))))
+
+        elif i.code == BPF_ST:
+            il.append(il.store(4, il.const_pointer(4, MEMORY_BASE + i.k * 4), il.reg(4, 'A')))
+
+        elif i.code == BPF_STX:
+            il.append(il.store(4, il.const_pointer(4, MEMORY_BASE + i.k * 4), il.reg(4, 'X')))
+
+        elif i.code == BPF_LD | BPF_W | BPF_ABS:
+            il.append(il.set_reg(4, 'A', il.load(4, il.const_pointer(4, SECCOMP_DATA_BASE + i.k))))
+
+        else:
+            il.append(il.unimplemented())
+
         return 8
 
 class SeccompView(BinaryView):
@@ -209,12 +327,25 @@ class SeccompView(BinaryView):
         self.add_auto_section('memory', MEMORY_BASE, MEMORY_CELLS * 4, SectionSemantics.ReadWriteDataSectionSemantics)
 
         # Syscall data
-        # TODO: length and contents
         self.add_auto_segment(
-            SECCOMP_DATA_BASE, 0x100, 0, 0,
-            SegmentFlag.SegmentReadable | SegmentFlag.SegmentDenyWrite | SegmentFlag.SegmentContainsData
+            SECCOMP_DATA_BASE, 0x40, 0, 0,
+            SegmentFlag.SegmentReadable | SegmentFlag.SegmentWritable | SegmentFlag.SegmentContainsData
         )
-        self.add_auto_section('data', SECCOMP_DATA_BASE, 0x100, SectionSemantics.ReadOnlyDataSectionSemantics)
+        self.add_auto_section('syscall_data', SECCOMP_DATA_BASE, 0x40, SectionSemantics.ReadWriteDataSectionSemantics)
+
+        seccomp_data = [
+            (0, 'syscall_number', 4),
+            (4, 'arch', 4),
+            (8, 'instruction_pointer', 8),
+            (16, 'arg_0', 8),
+            (24, 'arg_1', 8),
+            (32, 'arg_2', 8),
+            (40, 'arg_3', 8),
+            (48, 'arg_4', 8),
+            (56, 'arg_5', 8),
+        ]
+        for offset,name,size in seccomp_data:
+            self.define_data_var(SECCOMP_DATA_BASE + offset, Type.int(size), name)
 
         return True
 
