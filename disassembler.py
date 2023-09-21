@@ -64,9 +64,9 @@ class Instruction:
 
 
 def disassemble(raw: bytes) -> Instruction | None:
-    if len(raw) != 8: return None
+    if len(raw) < 8: return None
 
-    code, jt, jf, k = struct.unpack('<HBBi', raw)
+    code, jt, jf, k = struct.unpack('<HBBi', raw[:8])
     inst = Instruction(code, jt, jf, k)
 
     if inst.is_valid_seccomp():
