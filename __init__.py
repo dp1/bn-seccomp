@@ -211,7 +211,7 @@ class Seccomp(Architecture):
                     BPF_ADD: il.add,
                     BPF_SUB: il.sub,
                     BPF_MUL: il.mult,
-                    BPF_DIV: il.div_signed, # TODO is it really signed?
+                    BPF_DIV: il.div_unsigned,
                     BPF_AND: il.and_expr,
                     BPF_OR: il.or_expr,
                     BPF_XOR: il.xor_expr,
@@ -250,8 +250,8 @@ class Seccomp(Architecture):
                 else:
                     cmp = {
                         BPF_JEQ: il.compare_equal,
-                        BPF_JGT: il.compare_signed_greater_than, # TODO: unsigned?
-                        BPF_JGE: il.compare_signed_greater_equal,
+                        BPF_JGT: il.compare_unsigned_greater_than,
+                        BPF_JGE: il.compare_unsigned_greater_equal,
                     }[op](4, il.reg(4, 'A'), value)
 
                 t = il.get_label_for_address(Architecture['Seccomp'], jt)
@@ -332,18 +332,19 @@ class SeccompView(BinaryView):
         self.add_auto_section('syscall_data', SECCOMP_DATA_BASE, 0x40, SectionSemantics.ReadWriteDataSectionSemantics)
 
         seccomp_data = [
-            (0, 'syscall_number', 4),
-            (4, 'arch', 4),
-            (8, 'instruction_pointer', 8),
-            (16, 'arg_0', 8),
-            (24, 'arg_1', 8),
-            (32, 'arg_2', 8),
-            (40, 'arg_3', 8),
-            (48, 'arg_4', 8),
-            (56, 'arg_5', 8),
+            'syscall_number',
+            'arch',
+            'instruction_pointer_lo',
+            'instruction_pointer_hi',
+            'arg0_lo', 'arg0_hi',
+            'arg1_lo', 'arg1_hi',
+            'arg2_lo', 'arg2_hi',
+            'arg3_lo', 'arg3_hi',
+            'arg4_lo', 'arg4_hi',
+            'arg5_lo', 'arg5_hi',
         ]
-        for offset,name,size in seccomp_data:
-            self.define_data_var(SECCOMP_DATA_BASE + offset, Type.int(size), name)
+        for i,name in enumerate(seccomp_data):
+            self.define_data_var(SECCOMP_DATA_BASE + i*4, Type.int(4), name)
 
         return True
 
